@@ -176,37 +176,48 @@ if response.status_code != 200:
 
 # 读取进度
 result_url = None
+buffer = ""
 
-for line in response.iter_lines(decode_unicode=True):
-    # 跳过空行
-    if not line:
-        continue
+for chunk in response.iter_content(chunk_size=1024):
+    # 解码并累积到缓冲区
+    buffer += chunk.decode("utf-8", errors="ignore")
     
-    # 去掉 "data: " 前缀
-    if line.startswith("data: "):
-        line = line[6:]
-    
-    # 解析JSON
-    try:
-        data = json.loads(line)
-    except json.JSONDecodeError:
-        continue
-    
-    # 显示进度
-    progress = data.get("progress", 0)
-    status = data.get("status", "")
-    print(f"\r进度: {progress}%", end="", flush=True)
-    
-    # 生成成功
-    if status == "succeeded":
-        result_url = data["results"][0]["url"]
-        break
-    
-    # 生成失败
-    if status == "failed":
-        print()
-        print("生成失败:", data.get("error", "未知错误"))
-        sys.exit(1)
+    # 按行处理
+    while "\n" in buffer:
+        line, buffer = buffer.split("\n", 1)
+        line = line.strip()
+        
+        # 跳过空行
+        if not line:
+            continue
+        
+        # 去掉 "data: " 前缀
+        if line.startswith("data: "):
+            line = line[6:]
+        
+        # 解析JSON
+        try:
+            data = json.loads(line)
+        except json.JSONDecodeError:
+            print(f"\nJSON解析失败: {line[:100]}")
+            continue
+        
+        # 显示进度
+        progress = data.get("progress", 0)
+        status = data.get("status", "")
+        print(f"\r进度: {progress}%", end="", flush=True)
+        
+        # 生成成功
+        if status == "succeeded":
+            result_url = data["results"][0]["url"]
+            break
+        
+        # 生成失败
+        if status == "failed":
+            print("\n生成失败!")
+            print(f"  原因: {data.get('failure_reason', '未知')}")
+            print(f"  详情: {data.get('error', '无')}")
+            sys.exit(1)
 
 #############################
 # 保存结果
