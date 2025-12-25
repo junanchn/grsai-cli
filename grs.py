@@ -78,7 +78,7 @@ if not prompt:
 # 生成输出文件名
 #############################
 
-time_str = time.strftime("%m%d_%H%M%S")
+time_str = time.strftime("%m%d_%H%M")
 image_names = "_".join(os.path.splitext(os.path.basename(img))[0] for img in input_images)
 prompt_str = prompt[:20]
 
@@ -227,10 +227,18 @@ if result_url:
     print("\n下载结果...")
     
     response = requests.get(result_url, timeout=60)
+
+    # 如果文件存在，自动加序号 _1, _2, _3...
+    save_path = output_file
+    counter = 1
+    while os.path.exists(save_path):
+        name, ext = os.path.splitext(output_file)
+        save_path = f"{name}_{counter}{ext}"
+        counter += 1
     
-    with open(output_file, "wb") as f:
+    with open(save_path, "wb") as f:
         f.write(response.content)
     
-    print("已保存:", output_file)
+    print("已保存:", save_path)
 else:
     print("\n错误: 没有收到结果")
