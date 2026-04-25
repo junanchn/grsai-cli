@@ -2,12 +2,11 @@
 """
 GRSAI 图像生成脚本
 
-1. 命令行参数：图片文件(可多个)、提示词、尺寸(1K/2K/4K)、比例(16:9等)、数量(3x格式)
-2. 上传图片到 API，使用 MD5 哈希缓存避免重复上传，缓存有效期3天
-3. 调用流式 API 生成图像，解析 SSE 响应获取结果
-4. 支持并行生成多张图片，失败自动重试直到达到目标数量，有并行上限
-5. 补发策略可配置，按 Enter 可随时停止补发只等剩余任务完成
-6. 输出文件名包含原图名、提示词、时间戳，自动序号避免覆盖
+1. 命令行参数：图片文件(可多个)、提示词、模型、尺寸、比例、数量
+2. 支持 nano-banana-pro 和 gpt-image-2，两者均使用流式 SSE 响应
+3. 上传图片到 API，使用 MD5 哈希缓存避免重复上传，缓存有效期3天
+4. 支持并行生成多张图片，失败自动重试，按 Enter 停止补发
+5. 输出文件名包含原图名、提示词、时间戳，自动序号避免覆盖
 ======================
 """
 
@@ -18,8 +17,7 @@ import time
 import hashlib
 import requests
 import concurrent.futures
-import threading
-from threading import Lock, Event
+from threading import Lock, Event, Thread
 
 #############################
 # 配置
@@ -29,8 +27,23 @@ API_KEY = "这里替换你的 API Key"
 API_BASE = "https://api.grsai.com"
 
 FORMATS = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff", ".ico")
-SIZES = ("1K", "2K", "4K")
-RATIOS = ("auto", "1:1", "16:9", "9:16", "4:3", "3:4", "3:2", "2:3", "5:4", "4:5", "21:9")
+
+MODEL_CONFIG = {
+    "gpt-image-2": {
+        "endpoint": "/v1/draw/completions",
+        "ratios": ("auto", "1:1", "16:9", "9:16", "4:3", "3:4", "3:2", "2:3",
+                   "5:4", "4:5", "21:9", "9:21", "2:1", "1:2", "3:1", "1:3"),
+    },
+    "nano-banana-pro": {
+        "endpoint": "/v1/draw/nano-banana",
+        "sizes": ("1K", "2K", "4K"),
+        "ratios": ("auto", "1:1", "16:9", "9:16", "4:3", "3:4", "3:2", "2:3",
+                   "5:4", "4:5", "21:9"),
+    },
+}
+DEFAULT_MODEL = "gpt-image-2"
+ALL_SIZES = {s for c in MODEL_CONFIG.values() for s in c.get("sizes", ())}
+ALL_RATIOS = {r for c in MODEL_CONFIG.values() for r in c.get("ratios", ())}
 
 CACHE_FILE = "cache.json"
 CACHE_TIME = 3 * 24 * 60 * 60
@@ -41,19 +54,27 @@ MAX_PARALLEL = 10
 #############################
 
 def show_help():
+    gpt = MODEL_CONFIG["gpt-image-2"]
+    nano = MODEL_CONFIG["nano-banana-pro"]
     print(f"""GRSAI 图像生成脚本
 
-用法: python grs.py [图片...] [提示词] [尺寸] [比例] [数量]
+用法: python grs.py [图片...] [提示词] [模型] [尺寸] [比例] [数量]
 
-图片格式: {", ".join(FORMATS)}
-尺寸: {", ".join(SIZES)} (默认 1K)
-比例: {", ".join(RATIOS)} (默认 auto)
+图片: {", ".join(FORMATS)} (可选，支持多张)
 数量: 3x 表示至少生成3张 (默认 1x)
 
+gpt-image-2 (默认):
+  比例: {", ".join(gpt["ratios"])}
+
+nano-banana-pro:
+  尺寸: {", ".join(nano["sizes"])} (默认 1K)
+  比例: {", ".join(nano["ratios"])}
+
 示例:
-  python grs.py photo.png 变清晰
-  python grs.py photo.png 变清晰 2k 16:9 3x
-  python grs.py a.png b.png 融合风格 4K 5X""")
+  python grs.py photo.png 做成3D模型
+  python grs.py photo.png 画成水彩风格 16:9 3x
+  python grs.py 画一只猫
+  python grs.py photo.png 变清晰 nano-banana-pro 2k 16:9""")
     sys.exit(0)
 
 #############################
@@ -61,7 +82,7 @@ def show_help():
 #############################
 
 def parse_args():
-    if len(sys.argv) < 3:
+    if len(sys.argv) < 2:
         show_help()
     
     images = []
@@ -69,18 +90,21 @@ def parse_args():
     size = "1K"
     ratio = "auto"
     count = 1
+    model = DEFAULT_MODEL
     
     for arg in sys.argv[1:]:
         lower = arg.lower()
         upper = arg.upper()
         
-        if lower.endswith(FORMATS):
+        if lower in MODEL_CONFIG:
+            model = lower
+        elif lower.endswith(FORMATS):
             if not os.path.isfile(arg):
                 sys.exit(f"错误: 文件不存在: {arg}")
             images.append(arg)
-        elif upper in SIZES:
+        elif upper in ALL_SIZES:
             size = upper
-        elif arg in RATIOS:
+        elif arg in ALL_RATIOS:
             ratio = arg
         elif lower.endswith("x") and lower[:-1].isdigit():
             count = int(lower[:-1])
@@ -91,7 +115,7 @@ def parse_args():
     if not prompt:
         sys.exit("错误: 请提供提示词")
     
-    return images, prompt, size, ratio, count
+    return images, prompt, size, ratio, count, model
 
 #############################
 # 上传图片
@@ -145,26 +169,27 @@ def upload_images(images):
 # 生成一张图片
 #############################
 
-def generate_one(urls, prompt, size, ratio):
+def generate_one(urls, prompt, size, ratio, model):
     """
     生成一张图片。
     返回: (成功?, 文件路径或错误信息)
     """
+    cfg = MODEL_CONFIG[model]
+    body = {"model": model, "prompt": prompt, "aspectRatio": ratio}
+    if "sizes" in cfg:
+        body["imageSize"] = size
+    if urls:
+        body["urls"] = urls
+
     # 发送请求
     try:
         resp = requests.post(
-            f"{API_BASE}/v1/draw/nano-banana",
+            f"{API_BASE}{cfg['endpoint']}",
             headers={
                 "Authorization": f"Bearer {API_KEY}",
                 "Content-Type": "application/json"
             },
-            json={
-                "model": "nano-banana-pro",
-                "prompt": prompt,
-                "urls": urls,
-                "imageSize": size,
-                "aspectRatio": ratio
-            },
+            json=body,
             stream=True,
             timeout=300
         )
@@ -220,24 +245,33 @@ def generate_one(urls, prompt, size, ratio):
 
 def main():
     # 解析参数
-    images, prompt, size, ratio, target = parse_args()
+    images, prompt, size, ratio, target, model = parse_args()
     
     # 生成输出文件名模板
     time_str = time.strftime("%m%d_%H%M")
-    names = "_".join(os.path.splitext(os.path.basename(p))[0] for p in images)
-    prompt_short = prompt[:200]
-    template = f"{names}_{prompt_short}_{time_str}" if len(names) < 40 else f"{prompt_short}_{time_str}"
+    if images:
+        names = "_".join(os.path.splitext(os.path.basename(p))[0] for p in images)
+        template = f"{names}_{prompt[:200]}_{time_str}" if len(names) < 40 else f"{prompt[:200]}_{time_str}"
+    else:
+        template = f"{prompt[:200]}_{time_str}"
     for c in '\\/:*?"<>|':
         template = template.replace(c, "_")
     
-    # 上传图片
-    print("上传图片...")
-    urls = upload_images(images)
+    # 准备图片
+    if images:
+        print("上传图片...")
+        urls = upload_images(images)
+    else:
+        urls = []
+        print("(纯文本生成，无参考图)")
     
     # 开始生成
-    print(f"\n生成图像...")
+    cfg = MODEL_CONFIG[model]
+    print(f"\n生成图像... [{model}]")
     print(f"  提示词: {prompt}")
-    print(f"  尺寸: {size}, 比例: {ratio}")
+    if "sizes" in cfg:
+        print(f"  尺寸: {size}")
+    print(f"  比例: {ratio}")
     print(f"  目标: {target}张, 并行上限: {MAX_PARALLEL}\n")
     
     success = 0
@@ -251,12 +285,12 @@ def main():
         input()
         stop.set()
         print("\n⏸ 已停止补发，等待剩余任务...")
-    threading.Thread(target=listen, daemon=True).start()
+    Thread(target=listen, daemon=True).start()
     print("(按 Enter 停止补发)\n")
     
     def task():
         """单个生成任务"""
-        ok, result = generate_one(urls, prompt, size, ratio)
+        ok, result = generate_one(urls, prompt, size, ratio, model)
         
         if ok:
             # 保存文件
